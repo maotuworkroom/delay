@@ -122,6 +122,20 @@ jobs:
           python3 scripts/prepare_delay_assets.py
           npx wrangler@4 deploy --config static-worker/wrangler.toml 2>&1 | tail -12
 
+      # 仅试点用：把本次产物 data/ 上传成 artifact，便于与"改造前"逐字节比对。
+      # 只上传数据目录，绝不上传仓库根、也绝不包含解密出来的源码。
+      - name: Upload data snapshot（试点验收用）
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: encpilot-data
+          if-no-files-found: warn
+          path: |
+            data/delays.json
+            data/sukijr.json
+            data/lines.json
+            data/suki/**
+
       - name: Remove plaintext & assert clean tree（无论成败都执行）
         if: always()
         run: |
