@@ -1,3 +1,10 @@
 __pycache__/
 *.pyc
 static-worker/assets/
+
+# enc-pilot：由密文在 runner 上解密出来的明文路径（不入库，解密后也必须能被 git 完全忽略）
+/baker/
+/run.sh
+/scripts/mirror_comfort.py
+/scripts/prepare_delay_assets.py
+/verify_suki_match.py

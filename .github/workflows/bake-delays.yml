@@ -1,5 +1,12 @@
 name: bake-delays
 
+# 加密试点（分支 enc-pilot）：仓库里只有密文（encrypted/**.enc + encryption/manifest.tsv），
+# 明文只在 runner 的工作区短暂存在，跑完立即删除。
+# 口令只来自 Secrets.CODE_KEY，仓库任何位置都不出现。
+#
+# 本文件只保留调度、解密、调入口、提交、部署，不含业务逻辑：
+# 抓取与解析实现在 encrypted/ 下的密文里，入口 run.sh 同样是密文。
+#
 # The whole pipeline in one workflow:
 #   - every run: dokorail live feeds (+ JR own-source feeds) -> data/delays.json
 #     (only the timetable bundles of lines with delayed trains are fetched)
@@ -16,16 +23,10 @@ name: bake-delays
 # 日本限定源的出口: あおなみ線/ハピラインNAVI 只接受日本 IP, api.tokyoglance.com
 # 直接 403 runner, 所以它们的 AONAMI_BASE/HAPILINE_BASE/TOKYOGLANCE_BASE
 # 指向独立的 suki-jp-relay Worker
-# (另一个 Cloudflare 账号, Placement Hints 钉在东京机房)。它只认本 workflow
-# 现场签发的 GitHub OIDC 短时 JWT (aud=suki-jp-relay + repo/ref 校验, 无共享密钥);
-# 生产 jr-delay 保持纯静态资产, 不跑任何脚本。
-# comfort.json 也顺手镜像到 jr-delay, 主站第一消费源不再依赖 GitHub CDN。
 
 on:
   schedule:
     # 运行窗口: 东京时间 05:00 - 次日 02:00 (JST = UTC+9)
-    #   JST 05:00-26:00  =  UTC 20:00-23:59 (当日) + 00:00-17:00 (次日)
-    # GitHub cron 有 5-20 分钟抖动, 窗口边缘的班次可能略偏
     - cron: "*/10 20-23 * * *"
     - cron: "*/10 0-16 * * *"
     - cron: "0 17 * * *"    # 最后一班: JST 02:00 整
@@ -45,30 +46,32 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
-      # optional: ODPT consumer key (developer.odpt.org, free) enables
-      # Keikyu/Tobu/YokohamaMunicipal via api.odpt.org; without it only
-      # Toei comes through the keyless public mirror
       ODPT_KEY: ${{ secrets.ODPT_KEY }}
-      # optional: Cloudflare API token for jr-delay deploy
-      # (Workers Static Assets, pure static). Missing -> skip deploy.
       CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-      # Reverse proxy for dokorail.jp to bypass Cloudflare runner-IP block.
-      # Public Vercel edge; unset -> hits dokorail.jp directly.
       DOKORAIL_BASE: "https://dokorail-proxy.vercel.app"
-      # Japan-only feeds via suki-jp-relay (Placement Hints -> Tokyo). Every
-      # relay call carries the shared gate key (X-Relay-Key) plus a GitHub
-      # OIDC JWT minted per feed (common.jp_relay_token); requests missing
-      # either one get a static 404 from the Worker before any upstream fetch.
-      # 直连 origin 只在本地/有日本出口时可用（模块默认值就是 origin）。
       RELAY_KEY: ${{ secrets.RELAY_KEY }}
       AONAMI_BASE: "https://suki-jp-relay-7c41e9.lmc26817.workers.dev/jp/aonami"
       HAPILINE_BASE: "https://suki-jp-relay-7c41e9.lmc26817.workers.dev/jp/hapi"
-      # api.tokyoglance.com 403s runner IPs outright; same relay, Tokyo egress.
       TOKYOGLANCE_BASE: "https://suki-jp-relay-7c41e9.lmc26817.workers.dev/jp/tg"
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 
-      - uses: actions/setup-python@v5
+      - name: Decrypt sources（明文只存在于 runner，umask 077）
+        env:
+          # 口令仅经 runner 内存注入；不写文件、不进 argv、不打印
+          OOEP_PASSPHRASE: ${{ secrets.CODE_KEY }}
+        run: |
+          set +x
+          umask 077
+          python3 encryption/decrypt.py decrypt \
+            --enc encrypted \
+            --manifest encryption/manifest.tsv \
+            --out .
+        # 解密工具自带校验：密文 sha256、GCM tag、明文 HMAC 任一不符立即非 0 退出；
+        # 且拒绝覆盖已存在文件（仓库里若误留同名明文，这里直接 fail）。
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
           python-version: "3.12"
 
@@ -77,13 +80,14 @@ jobs:
       - name: Install Python deps
         run: pip install beautifulsoup4
 
-      - name: Refresh caches (weekly or when missing)
-        run: python -m baker.refresh --data-dir data
+      - name: Run scrapers（入口清单同样是密文）
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          set +x
+          bash run.sh
 
-      - name: Bake delay board
-        run: python -m baker.delays --data-dir data
-
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
         with:
           node-version: 22
 
@@ -104,20 +108,32 @@ jobs:
           fi
 
       # 把 jr-comfortable 的 comfort.json 镜像到自家域名（主站第一消费源）。
-      # 尽力而为：全部源失败则本次不产出 comfort.json，Worker 继续服务上一次部署。
       - name: Mirror comfort.json onto jr-delay
         if: ${{ env.CF_API_TOKEN != '' }}
         run: python3 scripts/mirror_comfort.py
 
-      # 部署到 Cloudflare jr-delay（纯静态资产，无 Worker 脚本，零计费）。
-      # 域名路由 jr-delay.suki.ing/* 已在 Dashboard 创建，主站主源即
-      # https://jr-delay.suki.ing/delays.json
-      # wrangler 按内容哈希增量上传：数据未变化时秒级跳过。
       - name: Deploy delay JSON to Cloudflare (jr-delay)
         if: ${{ env.CF_API_TOKEN != '' }}
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: c75ed9a498500d7c232d9d59a353341d
         run: |
+          set +x
           python3 scripts/prepare_delay_assets.py
           npx wrangler@4 deploy --config static-worker/wrangler.toml 2>&1 | tail -12
+
+      - name: Remove plaintext & assert clean tree（无论成败都执行）
+        if: always()
+        run: |
+          set +x
+          python3 encryption/decrypt.py clean \
+            --manifest encryption/manifest.tsv \
+            --out .
+          git status --porcelain
+          test -z "$(git status --porcelain)"
+
+# 说明：
+# 1. 不挂带 required reviewers 的 environment，保证 schedule 无人值守。
+# 2. 不增加 pull_request / pull_request_target 触发器（外部 PR 是 secret 滥用的经典入口）。
+# 3. 不开 ACTIONS_STEP_DEBUG，任何步骤都不 bash -x、不 cat 解密出的文件。
+# 4. 第三方 action 全部按 commit SHA 钉死。
